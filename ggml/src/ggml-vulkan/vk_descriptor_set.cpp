@@ -5,7 +5,7 @@ namespace ggml_vk {
 
 DescriptorManager::DescriptorManager(vk::Device device,
                                      uint32_t max_bindless_buffers,
-                                     uint32_t max_per_dispatch_sets)
+                                     uint32_t /*max_per_dispatch_sets*/)
     : _device(device)
     , _max_bindless_buffers(max_bindless_buffers) {
 
@@ -69,13 +69,10 @@ DescriptorManager::DescriptorManager(vk::Device device,
         }
         _bindless_set = vk_set;
     }
-
-    // Pre-create first per-dispatch pool
-    ensure_pool();
 }
 
 DescriptorManager::~DescriptorManager() {
-    for (auto& pool : _pools) {
+    for (auto& pool : _per_dispatch_pools) {
         if (pool) {
             vkDestroyDescriptorPool(_device, pool, nullptr);
         }
@@ -92,6 +89,7 @@ DescriptorManager::~DescriptorManager() {
 uint32_t DescriptorManager::register_buffer(vk::Buffer buffer,
                                             uint64_t offset,
                                             uint64_t range) {
+    std::lock_guard<std::mutex> lock(_mutex);
     uint32_t index;
     if (!_bindless_free_list.empty()) {
         index = _bindless_free_list.back();
@@ -125,6 +123,7 @@ void DescriptorManager::update_buffer(uint32_t index,
                                        vk::Buffer buffer,
                                        uint64_t offset,
                                        uint64_t range) {
+    std::lock_guard<std::mutex> lock(_mutex);
     VkDescriptorBufferInfo buf_info{};
     buf_info.buffer = buffer;
     buf_info.offset = offset;
@@ -143,6 +142,7 @@ void DescriptorManager::update_buffer(uint32_t index,
 }
 
 void DescriptorManager::unregister_buffer(uint32_t index) {
+    std::lock_guard<std::mutex> lock(_mutex);
     if (index >= _max_bindless_buffers) {
         throw std::runtime_error("DescriptorManager: invalid bindless index");
     }
@@ -151,7 +151,7 @@ void DescriptorManager::unregister_buffer(uint32_t index) {
     VkDescriptorBufferInfo buf_info{};
     buf_info.buffer = VK_NULL_HANDLE;
     buf_info.offset = 0;
-    buf_info.range = 0;
+    buf_info.range = VK_WHOLE_SIZE;
 
     VkWriteDescriptorSet write{};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -167,12 +167,12 @@ void DescriptorManager::unregister_buffer(uint32_t index) {
 }
 
 void DescriptorManager::reset_bindless() {
+    std::lock_guard<std::mutex> lock(_mutex);
     // Null out all active bindless descriptor slots to avoid stale VkBuffer references.
-    // Only safe to call when no GPU work is in flight referencing these slots.
     VkDescriptorBufferInfo null_info{};
     null_info.buffer = VK_NULL_HANDLE;
     null_info.offset = 0;
-    null_info.range = 0;
+    null_info.range = VK_WHOLE_SIZE;
 
     for (uint32_t i = 0; i < _bindless_count; ++i) {
         VkWriteDescriptorSet write{};
@@ -192,29 +192,30 @@ void DescriptorManager::reset_bindless() {
 }
 
 vk::DescriptorSet DescriptorManager::allocate_set(vk::DescriptorSetLayout layout) {
-    ensure_pool();
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (_per_dispatch_next_idx < _per_dispatch_sets.size()) {
+        return _per_dispatch_sets[_per_dispatch_next_idx++];
+    }
+
+    // Need to allocate a new set
+    ensure_per_dispatch_pool();
 
     VkDescriptorSetLayout vk_layout = layout;
     VkDescriptorSetAllocateInfo alloc_info{};
     alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc_info.descriptorPool = _pools[_current_pool_idx];
+    alloc_info.descriptorPool = _per_dispatch_pools.back();
     alloc_info.descriptorSetCount = 1;
     alloc_info.pSetLayouts = &vk_layout;
 
     VkDescriptorSet vk_set;
     VkResult res = vkAllocateDescriptorSets(_device, &alloc_info, &vk_set);
-    if (res == VK_ERROR_OUT_OF_POOL_MEMORY) {
-        // Move to next pool
-        _current_pool_idx++;
-        ensure_pool();
-        alloc_info.descriptorPool = _pools[_current_pool_idx];
-        res = vkAllocateDescriptorSets(_device, &alloc_info, &vk_set);
-    }
     if (res != VK_SUCCESS) {
         throw std::runtime_error("DescriptorManager: failed to allocate descriptor set");
     }
 
-    _sets_allocated_in_current_pool++;
+    _per_dispatch_sets.push_back(vk_set);
+    _per_dispatch_next_idx++;
     return vk_set;
 }
 
@@ -255,28 +256,24 @@ void DescriptorManager::write_buffers(vk::DescriptorSet set,
 }
 
 void DescriptorManager::reset_pools() {
-    // Reset all pools for reuse
-    for (auto& pool : _pools) {
-        if (pool) {
-            vkResetDescriptorPool(_device, pool, 0);
-        }
-    }
-    _current_pool_idx = 0;
-    _sets_allocated_in_current_pool = 0;
+    std::lock_guard<std::mutex> lock(_mutex);
+    _per_dispatch_next_idx = 0;
 }
 
-void DescriptorManager::ensure_pool() {
-    while (_current_pool_idx >= _pools.size()) {
+void DescriptorManager::ensure_per_dispatch_pool() {
+    // Must be called with _mutex held
+    if (_per_dispatch_pools.empty() ||
+        (_per_dispatch_sets.size() % kSetsPerPool) == 0) {
         VkDescriptorPoolSize pool_sizes[2];
         pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        pool_sizes[0].descriptorCount = kMaxDescriptorsPerPool;
+        pool_sizes[0].descriptorCount = 65536;
         pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
         pool_sizes[1].descriptorCount = 64;
 
         VkDescriptorPoolCreateInfo pool_ci{};
         pool_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_ci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-        pool_ci.maxSets = kMaxSetsPerPool;
+        pool_ci.maxSets = kSetsPerPool;
         pool_ci.poolSizeCount = 2;
         pool_ci.pPoolSizes = pool_sizes;
 
@@ -284,9 +281,8 @@ void DescriptorManager::ensure_pool() {
         if (vkCreateDescriptorPool(_device, &pool_ci, nullptr, &pool) != VK_SUCCESS) {
             throw std::runtime_error("DescriptorManager: failed to create pool");
         }
-        _pools.push_back(pool);
+        _per_dispatch_pools.push_back(pool);
     }
-    _sets_allocated_in_current_pool = 0;
 }
 
 } // namespace ggml_vk

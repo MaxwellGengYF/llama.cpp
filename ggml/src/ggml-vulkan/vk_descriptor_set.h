@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 namespace ggml_vk {
 
@@ -51,6 +52,7 @@ public:
     // -- Per-dispatch descriptor sets (set=1) --
 
     // Allocate a descriptor set for a pipeline layout.
+    // Sets are reused across graph computes; reset_pools() only resets the index.
     [[nodiscard]] vk::DescriptorSet allocate_set(vk::DescriptorSetLayout layout);
 
     // Write buffer descriptors to a set. Returns the set.
@@ -58,11 +60,12 @@ public:
                        uint32_t first_binding,
                        vk::ArrayProxy<const vk::DescriptorBufferInfo> buffer_infos);
 
-    // Reset per-frame pools (call at start of each graph execution).
+    // Reset per-frame index (call at start of each graph execution).
     void reset_pools();
 
 private:
     vk::Device _device;
+    mutable std::mutex _mutex;
 
     // Bindless
     vk::DescriptorPool _bindless_pool{};
@@ -72,14 +75,13 @@ private:
     uint32_t _bindless_count{0};
     std::vector<uint32_t> _bindless_free_list;
 
-    // Per-dispatch
-    std::vector<vk::DescriptorPool> _pools;
-    uint32_t _current_pool_idx{0};
-    uint32_t _sets_allocated_in_current_pool{0};
-    static constexpr uint32_t kMaxSetsPerPool = 256;
-    static constexpr uint32_t kMaxDescriptorsPerPool = 65536;
+    // Per-dispatch: sets are allocated once and reused forever.
+    std::vector<vk::DescriptorPool> _per_dispatch_pools;
+    std::vector<vk::DescriptorSet> _per_dispatch_sets;
+    uint32_t _per_dispatch_next_idx{0};
+    static constexpr uint32_t kSetsPerPool = 256;
 
-    void ensure_pool();
+    void ensure_per_dispatch_pool();
 };
 
 } // namespace ggml_vk

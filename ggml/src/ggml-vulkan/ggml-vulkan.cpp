@@ -996,7 +996,8 @@ struct vk_subbuffer {
     uint64_t size;
 
     operator vk::DescriptorBufferInfo() const {
-        return { buffer->buffer, offset, size };
+        // Avoid zero range which triggers Vulkan validation errors.
+        return { buffer->buffer, offset, size == 0 ? vk::WholeSize : size };
     }
 };
 
@@ -6404,17 +6405,20 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
         }
     }
 
-    // Descriptor manager (shared across contexts)
-    if (!ctx->device->desc_manager) {
-        try {
-            ctx->device->desc_manager = std::make_unique<ggml_vk::DescriptorManager>(
-                ctx->device->device,
-                262144,   // max bindless buffers
-                65536);   // max per-dispatch sets
-        } catch (...) {
-            // Descriptor manager failed; fall back to inline descriptors
-        }
-    }
+    // Descriptor manager disabled: per-dispatch descriptor sets are not
+    // thread-safe when shared across contexts. Fall back to per-context
+    // inline descriptors which are proven to work.
+    //
+    // if (!ctx->device->desc_manager) {
+    //     try {
+    //         ctx->device->desc_manager = std::make_unique<ggml_vk::DescriptorManager>(
+    //             ctx->device->device,
+    //             262144,
+    //             65536);
+    //     } catch (...) {
+    //         // Descriptor manager failed; fall back to inline descriptors
+    //     }
+    // }
 
     // Upload ring buffer (per-context, 64 MB)
     if (ctx->device->vma_allocator) {
